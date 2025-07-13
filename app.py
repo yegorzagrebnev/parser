@@ -1,213 +1,186 @@
 import streamlit as st
+import sqlite3
+import pandas as pd
+import os
+from datetime import datetime
 from core import (
     fetch_and_store_single,
     simulate_admission,
+    simulate_contract,
     export_to_excel,
     lookup_reg_number,
-    get_connection,
-    ID_LIST
+    ID_LIST,
+    CONTRACT_ID_LIST
 )
-import pandas as pd
-import os
-import sqlite3
-from datetime import datetime
 
+DB_PATH = "abit.db"
 
-st.set_page_config(page_title="Магистерский калькулятор", layout="wide")
-st.title("🎓 Магистерский калькулятор: оцени свои шансы на поступление")
-
-st.markdown("""
-Это приложение позволяет:
-- Загрузить актуальные рейтинги поступающих в магистратуру с сайта ЮУрГУ
-- Смоделировать зачисление на бюджет по приоритету и баллам
-
-**Шаги:**
-1. Нажмите «🔄 Загрузить свежие данные» (при необходимости)
-2. После загрузки — «✅ Смоделировать зачисление»
-3. Скачайте Excel-файл или воспользуйтесь поиском абитуриента по его СНИЛС
-            
-⚠ ВАЖНО: Приложение ориентируется исключительно на списки поступающих на бюджет.
-Учёт бакалавров, аспирантов и контрактников появится позже.
-            
-**Автор:** [Егор](https://t.me/yetanothercreativeusername)
-            
-**Поблагодарить рублём:** [Тинькофф](https://www.tinkoff.ru/rm/r_omVCvObggH.qSLGCbPrSM/S2bsI15773)
-""")
-
-if "data_loaded" not in st.session_state:
-    try:
-        conn = sqlite3.connect("abit.db")
-        cur = conn.cursor()
-        cur.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'applicants_%'")
-        has_tables = bool(cur.fetchall())
-        cur.execute("SELECT value FROM metadata WHERE key = 'last_updated'")
-        row = cur.fetchone()
-        conn.close()
-
-        st.session_state.data_loaded = has_tables
-        st.session_state.last_updated = row[0] if row else None
-    except Exception:
-        st.session_state.data_loaded = False
-        st.session_state.last_updated = None
-
-if "last_excel_path" not in st.session_state:
-    st.session_state.last_excel_path = None
-
-def load_cached_data():
-    conn = get_connection()
-    places = {}
-    names = {}
-    times = {}
-
+def load_budget_data():
+    conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-
-    for direction_id in ID_LIST:
-        table = f"applicants_{direction_id}"
+    places, names, times = {}, {}, {}
+    for did in ID_LIST:
         try:
-            cur.execute(f"SELECT COUNT(*) FROM {table}")
-            if cur.fetchone()[0] == 0:
-                continue
-
-            cur.execute("SELECT value FROM metadata WHERE key = ?", (f"name_{direction_id}",))
-            raw = cur.fetchone()
-            names[direction_id] = raw[0] if raw else f"Направление {direction_id}"
-
-            cur.execute("SELECT value FROM metadata WHERE key = ?", (f"time_{direction_id}",))
-            raw = cur.fetchone()
-            times[direction_id] = raw[0] if raw else "неизвестно"
-
-            cur.execute("SELECT value FROM metadata WHERE key = ?", (f"places_{direction_id}",))
-            raw = cur.fetchone()
-            places[direction_id] = int(raw[0]) if raw else 10
-
+            cur.execute("SELECT value FROM metadata WHERE key = ?", (f"places_{did}",))
+            places[did] = int(cur.fetchone()[0])
+            cur.execute("SELECT value FROM metadata WHERE key = ?", (f"name_{did}",))
+            names[did] = cur.fetchone()[0]
+            cur.execute("SELECT value FROM metadata WHERE key = ?", (f"time_{did}",))
+            times[did] = cur.fetchone()[0]
         except:
             continue
-
     conn.close()
     return places, names, times
 
-if st.session_state.data_loaded:
-    if "places" not in st.session_state:
-        places, names, times = load_cached_data()
-        st.session_state.places = places
-        st.session_state.names = names
-        st.session_state.times = times
-        st.session_state.failures = []
-    st.info(f"✅ Используются локальные данные. Последнее обновление: {st.session_state.last_updated}")
-else:
-    st.warning("⚠ Данные ещё не загружены. Пожалуйста, нажмите кнопку ниже.")
-
-if st.session_state.data_loaded:
-    if st.button("🗑 Очистить локальные данные"):
+def load_contract_data():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    places, names, times = {}, {}, {}
+    for did in CONTRACT_ID_LIST:
         try:
-            os.remove("abit.db")
-            st.session_state.data_loaded = False
-            st.session_state.last_updated = None
-            st.success("База данных очищена.")
-        except Exception as e:
-            st.error(f"Не удалось удалить базу данных: {e}")
+            cur.execute("SELECT value FROM metadata WHERE key = ?", (f"contract_places_{did}",))
+            places[did] = int(cur.fetchone()[0])
+            cur.execute("SELECT value FROM metadata WHERE key = ?", (f"contract_name_{did}",))
+            names[did] = cur.fetchone()[0]
+            cur.execute("SELECT value FROM metadata WHERE key = ?", (f"contract_time_{did}",))
+            times[did] = cur.fetchone()[0]
+        except:
+            continue
+    conn.close()
+    return places, names, times
 
-tab1, tab2 = st.tabs(["📥 Загрузка данных и симуляция зачисления", "🔍 Поиск абитуриента по СНИЛС"])
-
-with tab1:
-    st.subheader("📥 Загрузка рейтингов и симуляция зачисления")
-
-    if st.button("🔄 Загрузить свежие данные"):
-        with st.spinner("Загружаем данные по направлениям..."):
-            progress_text = st.empty()
-            progress_bar = st.progress(0)
-
-            total = len(ID_LIST)
-            places = {}
-            names = {}
-            times = {}
-            failures = []
-
-            for i, direction_id in enumerate(ID_LIST):
-                progress_text.text(f"🔄 Загрузка направления ID {direction_id} ({i + 1}/{total})")
-                result = fetch_and_store_single(direction_id)
-                if result:
-                    p, n, t = result
-                    places[direction_id] = p
-                    names[direction_id] = n
-                    times[direction_id] = t
-                else:
-                    failures.append(direction_id)
-                progress_bar.progress((i + 1) / total)
-
-            st.session_state.places = places
-            st.session_state.names = names
-            st.session_state.times = times
-            st.session_state.failures = failures
-            st.session_state.data_loaded = True
-            st.session_state.last_updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-            try:
-                conn = sqlite3.connect("abit.db")
-                cur = conn.cursor()
-                cur.execute("REPLACE INTO metadata (key, value) VALUES (?, ?)", ("last_updated", st.session_state.last_updated))
-                for direction_id in ID_LIST:
-                    cur.execute("REPLACE INTO metadata (key, value) VALUES (?, ?)", (f"places_{direction_id}", str(places.get(direction_id, 10))))
-                conn.commit()
-                conn.close()
-            except Exception as e:
-                st.error(f"Ошибка при сохранении даты обновления: {e}")
-
-        st.success("✅ Данные успешно загружены")
-        if failures:
-            st.warning(f"⚠ Не удалось загрузить направления: {failures}")
-
-    if st.session_state.data_loaded and st.button("✅ Смоделировать зачисление"):
-        with st.spinner("Симулируем зачисление..."):
-            admitted = simulate_admission(st.session_state.places)
-            excel_path = export_to_excel(admitted, st.session_state.names, st.session_state.times)
-            st.session_state.last_excel_path = excel_path
-            st.success("🎉 Симуляция завершена. Результаты сохранены.")
-
-            if os.path.exists(excel_path):
-                with open(excel_path, "rb") as f:
-                    st.download_button(
-                        "📥 Скачать Excel-файл с результатами",
-                        f,
-                        file_name=os.path.basename(excel_path),
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-
-            for direction_id, entries in admitted.items():
-                st.subheader(f"{direction_id} — {st.session_state.names.get(direction_id)}")
-                df = pd.DataFrame(entries, columns=["Регистрационный номер", "Баллы", "Приоритет"])
-                df.index += 1
-                df.index.name = "Место"
-                st.dataframe(df, use_container_width=True)
-
-with tab2:
-    st.subheader("🔍 Поиск по СНИЛС")
-
-    reg_input = st.text_input("Укажите СНИЛС:")
-
-    if st.button("🔎 Найти"):
-        if not st.session_state.get("data_loaded"):
-            st.warning("⚠ Сначала загрузите рейтинги на первой вкладке.")
-        elif not reg_input.strip():
-            st.error("Введите корректный СНИЛС.")
+if "budget_loaded" not in st.session_state:
+    if os.path.exists(DB_PATH):
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'applicants_%'")
+        if cur.fetchall():
+            pl, nm, tm = load_budget_data()
+            st.session_state.budget_places = pl
+            st.session_state.budget_names = nm
+            st.session_state.budget_times = tm
+            st.session_state.budget_loaded = True
         else:
-            with st.spinner("Ищем..."):
-                results = lookup_reg_number(reg_input.strip())
-                if results:
-                    df = pd.DataFrame(results)
-                    df = df.rename(columns={
-                        "direction_id": "ID направления",
-                        "position": "Позиция",
-                        "reg_number": "Рег. номер",
-                        "total_score": "Баллы (общие)",
-                        "individual_achievements": "Баллы (ИД)",
-                        "has_originals": "Оригинал",
-                        "priority": "Приоритет"
-                    })
-                    df.index += 1
-                    df.index.name = "Найдено"
-                    st.success(f"✅ Найдено направлений: {len(df)}")
-                    st.dataframe(df, use_container_width=True)
+            st.session_state.budget_loaded = False
+        conn.close()
+    else:
+        st.session_state.budget_loaded = False
+
+if "contract_loaded" not in st.session_state:
+    if os.path.exists(DB_PATH):
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'contract_applicants_%'")
+        if cur.fetchall():
+            pl, nm, tm = load_contract_data()
+            st.session_state.contract_places = pl
+            st.session_state.contract_names = nm
+            st.session_state.contract_times = tm
+            st.session_state.contract_loaded = True
+        else:
+            st.session_state.contract_loaded = False
+        conn.close()
+    else:
+        st.session_state.contract_loaded = False
+
+st.set_page_config(page_title="Магистерский калькулятор", layout="wide")
+st.title("🎓 Магистерский калькулятор")
+
+tabs = st.tabs(["📥 Бюджет", "📥 Контракт", "🔍 Поиск абитуриента по СНИЛС"])
+
+with tabs[0]:
+    st.subheader("Загрузка и симуляция поступления на бюджет")
+    if st.session_state.budget_loaded:
+        st.info("Данные поступающих на бюджет уже загружены")
+    if st.button("🔄 Загрузить данные (бюджет)"):
+        with st.spinner("Загружаем списки поступающих на бюджет..."):
+            prog = st.progress(0)
+            places, names, times, fails = {}, {}, {}, []
+            for i, did in enumerate(ID_LIST):
+                res = fetch_and_store_single(did, contract=False)
+                if res:
+                    p, n, t = res
+                    places[did], names[did], times[did] = p, n, t
                 else:
-                    st.info("Ничего не найдено по данному номеру.")
+                    fails.append(did)
+                prog.progress((i+1)/len(ID_LIST))
+            st.session_state.budget_places = places
+            st.session_state.budget_names = names
+            st.session_state.budget_times = times
+            st.session_state.budget_loaded = True
+        if fails:
+            st.warning(f"Не удалось загрузить списки: {fails}")
+    if st.button("🗑 Очистить данные (бюджет)"):
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
+        st.session_state.budget_loaded = False
+        st.success("Списки поступающих на бюджет очищены")
+    if st.session_state.budget_loaded and st.button("✅ Симулировать (бюджет)"):
+        adm = simulate_admission(st.session_state.budget_places)
+        path = export_to_excel(adm, st.session_state.budget_names, st.session_state.budget_times)
+        st.success("Симуляция поступления на бюджет завершена")
+        with open(path, "rb") as f:
+            st.download_button("📥 Скачать Excel (бюджет)", f, file_name=os.path.basename(path))
+        for did, lst in adm.items():
+            st.subheader(f"{did} — {st.session_state.budget_names[did]}")
+            df = pd.DataFrame(lst, columns=["Регистрационный номер (СНИЛС)", "Баллы", "Приоритет"])
+            df.index += 1; df.index.name = "Место"
+            st.dataframe(df, use_container_width=True)
+
+with tabs[1]:
+    st.subheader("Загрузка и симуляция поступления на контракт")
+    if st.session_state.contract_loaded:
+        st.info("Данные поступающих на контракт уже загружены")
+    if st.button("🔄 Загрузить данные (контракт)"):
+        if not st.session_state.budget_loaded:
+            st.warning("Сначала загрузите списки поступающих на бюджет")
+        else:
+            with st.spinner("Загружаем списки поступающих на контракт..."):
+                prog = st.progress(0)
+                c_places, c_names, c_times, fails = {}, {}, {}, []
+                for i, did in enumerate(CONTRACT_ID_LIST):
+                    res = fetch_and_store_single(did, contract=True)
+                    if res:
+                        p, n, t = res
+                        c_places[did], c_names[did], c_times[did] = p, n, t
+                    else:
+                        fails.append(did)
+                    prog.progress((i+1)/len(CONTRACT_ID_LIST))
+                st.session_state.contract_places = c_places
+                st.session_state.contract_names = c_names
+                st.session_state.contract_times = c_times
+                st.session_state.contract_loaded = True
+            if fails:
+                st.warning(f"Не удалось загрузить списки: {fails}")
+    if st.button("🗑 Очистить данные (контракт)"):
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
+        st.session_state.contract_loaded = False
+        st.success("Данные поступающих на контракт очищены")
+    if st.session_state.contract_loaded and st.session_state.budget_loaded and st.button("✅ Симулировать (контракт)"):
+        budget_adm = simulate_admission(st.session_state.budget_places)
+        adm_c = simulate_contract(budget_adm, st.session_state.contract_places)
+        path = export_to_excel(adm_c, st.session_state.contract_names, st.session_state.contract_times)
+        st.success("Симуляция поступления на контракт завершена")
+        with open(path, "rb") as f:
+            st.download_button("📥 Скачать Excel (контракт)", f, file_name=os.path.basename(path))
+        for did, lst in adm_c.items():
+            st.subheader(f"{did} — {st.session_state.contract_names[did]}")
+            df = pd.DataFrame(lst, columns=["Регистрационный номер (СНИЛС)", "Баллы", "Приоритет"])
+            df.index += 1; df.index.name = "Место"
+            st.dataframe(df, use_container_width=True)
+
+with tabs[2]:
+    st.subheader("Поиск абитуриента по его СНИЛС")
+    reg = st.text_input("Укажите СНИЛС:")
+    if st.button("🔎 Найти"):
+        if not reg.strip():
+            st.error("Укажите корректный СНИЛС.")
+        else:
+            res = lookup_reg_number(reg.strip())
+            if res:
+                df = pd.DataFrame(res)
+                df.index += 1; df.index.name = "№"
+                st.dataframe(df, use_container_width=True)
+            else:
+                st.info("Ничего не найдено.")
